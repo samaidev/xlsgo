@@ -36,6 +36,20 @@ func main() {
 - 自动筛选：`ws.AutoFilter("A1:D10")`
 - 数据验证：`ws.AddDataValidation("A2:A10", "Yes,No,Maybe")`
 
+## 旧版 .xls 支持（只读）
+
+旧版二进制 `.xls`（BIFF8）支持**只读**读取与转换为 `.xlsx`：
+
+```go
+wb, _ := xlsgo.OpenLegacy("old.xls")
+for _, sh := range wb.Sheets {
+    fmt.Println(sh.Name, sh.Cells) // 读取工作表与单元格
+}
+xlsxBytes, _ := wb.ToXLSX()        // 转换为现代 .xlsx
+```
+
+> 设计约束：旧版 Office 文件仅支持读取，编辑请使用现代 `.xlsx` 格式。
+
 ## 许可证
 
 MIT
