@@ -114,6 +114,62 @@ func TestParseRecordsHandlesTruncation(t *testing.T) {
 	}
 }
 
+// TestParseRecordsZeroLengthRecord 验证 0 长度记录（如 InterfaceHdr 0x00E2）
+// 不会中断整个流的解析（此前曾因误判为损坏而提前终止）。
+func TestParseRecordsZeroLengthRecord(t *testing.T) {
+	var b biffBuilder
+	b.rec(recBOF, []byte{1, 2, 3, 4})
+	b.rec(0x00E2, nil) // 合法的 0 长度记录
+	b.rec(recNumber, numberRec(0, 0, 7))
+	b.rec(recEOF, nil)
+
+	recs := parseRecords(b.buf)
+	if len(recs) != 4 {
+		t.Fatalf("期望 4 条记录（含 0 长度），实际 %d 条: %v", len(recs), recs)
+	}
+}
+
+// TestBoolErrCell 验证错误值单元格被映射为 Excel 的错误字符串。
+func TestBoolErrCell(t *testing.T) {
+	var b biffBuilder
+	// 构造工作表流：BOF + 一条 BoolErr 记录（b7=1 表示错误，b6=0x07=#DIV/0!）+ EOF。
+	b.rec(recBOF, []byte{0x00, 0x06}) // 类型为 worksheet
+	boolErr := append(u16(0), u16(0)...) // row, col
+	boolErr = append(boolErr, u16(0)...)  // ixfe
+	boolErr = append(boolErr, 0x01, 0x01) // b6=错误码(#DIV/0!=0x01, BIFF紧凑编码), b7=1 表示错误（非布尔）
+	b.rec(recBoolErr, boolErr)
+	b.rec(recEOF, nil)
+
+	grid := parseSheetCells(b.buf, nil)
+	if len(grid) == 0 || len(grid[0]) == 0 {
+		t.Fatal("未解析出单元格")
+	}
+	if got := grid[0][0]; got != "#DIV/0!" {
+		t.Errorf("BoolErr = %q, want '#DIV/0!'", got)
+	}
+}
+
+// TestFormulaErrorTail 验证公式结果区以末尾 0xFFFF 标记（xlwt 风格）时
+// 能正确识别为错误值而非产生 NaN。
+func TestFormulaErrorTail(t *testing.T) {
+	var b biffBuilder
+	b.rec(recBOF, []byte{0x00, 0x06})
+	// 公式记录：rw(0)+col(0)+ixfe(0) + 结果 8 字节 = 03 00 00 00 00 00 FF FF
+	formula := append(u16(0), u16(0)...)
+	formula = append(formula, 0, 0) // ixfe
+	formula = append(formula, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF)
+	b.rec(recFormula, formula)
+	b.rec(recEOF, nil)
+
+	grid := parseSheetCells(b.buf, nil)
+	if len(grid) == 0 || len(grid[0]) == 0 {
+		t.Fatal("未解析出公式单元格")
+	}
+	if got := grid[0][0]; got == "NaN" || got == "" {
+		t.Errorf("公式结果 = %q, 不应为 NaN/空", got)
+	}
+}
+
 // TestSSTCompressedStrings 验证单字节压缩形式的字符串表。
 func TestSSTCompressedStrings(t *testing.T) {
 	var b biffBuilder

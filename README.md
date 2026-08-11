@@ -48,6 +48,10 @@ for _, sh := range wb.Sheets {
 xlsxBytes, _ := wb.ToXLSX()        // 转换为现代 .xlsx
 ```
 
+读取逻辑借鉴 LibreOffice BIFF 解析范式：正确处理共享字符串表（含 CONTINUE 跨记录拼接）、
+RK 数值、公式与布尔/错误结果（错误值如 `#DIV/0!` 以文本呈现）；加密（受密码保护）的
+`.xls` 文件会被明确拒绝。
+
 > 设计约束：旧版 Office 文件仅支持读取，编辑请使用现代 `.xlsx` 格式。
 
 ## 许可证

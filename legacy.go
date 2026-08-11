@@ -87,7 +87,14 @@ func parseLegacy(c *cfb.Container) (*LegacyWorkbook, error) {
 			strings.Join(c.Names(), ", "))
 	}
 
+	// 防御性检查：首条 BOF 记录的加密标志位（data[0] 第 0 位）。
+	// 加密的工作簿（受密码保护）无法在不解密的情况下读取，参照 LibreOffice 直接拒绝。
 	recs := parseRecords(stream)
+	if len(recs) > 0 && recs[0].typ == recBOF && len(recs[0].data) >= 1 {
+		if recs[0].data[0]&0x01 != 0 {
+			return nil, fmt.Errorf("xlsgo: 不支持读取加密（受密码保护）的 .xls 文件")
+		}
+	}
 
 	// 第一遍：读取共享字符串表和工作表清单。
 	// 单元格记录以下标引用 SST，因此必须先行解析。
@@ -129,6 +136,13 @@ func parseRecords(stream []byte) []record {
 		length := int(binary.LittleEndian.Uint16(stream[i+2:]))
 		i += 4
 
+		// 防御：长度为 0 的记录（如 InterfaceHdr 0x00E2）在合法 BIFF 文件中
+		// 确实会出现。此时 i 已经前进了 4 字节（记录头），继续循环即可安全跳过，
+		// 不会陷入死循环。仅当记录头本身无法继续时才停止。
+		if length == 0 {
+			recs = append(recs, record{typ: typ, data: nil})
+			continue
+		}
 		if i+length > len(stream) {
 			// 记录被截断，忽略剩余部分。
 			break
@@ -403,27 +417,54 @@ func parseSheetCells(stream []byte, sst []string) [][]string {
 					note(row, col, "FALSE")
 				}
 			} else {
-				note(row, col, "#ERR")
+				// b6 为错误码，映射为 Excel 的错误字符串（借鉴 LibreOffice 的 ScGlobal::GetErrorString）。
+				note(row, col, xlsErrorString(r.data[6]))
 			}
 
 		case recFormula:
-			// 公式的字符串结果存放在紧随其后的 STRING 记录中；
-			// 数值结果则直接内联在本记录里。
+			// 公式的结果（缓存值）存放在记录末尾 8 字节中：
+			//   - 标准 BIFF8：前 2 字节为 0xFFFF 标记，其后指明类型与值；
+			//   - 部分写入器（如 xlwt）把 0xFFFF 标记放在末尾，前 2 字节
+			//     为未计算/错误标志。
+			// 只读提取器读取的是文件中的缓存结果；未计算的公式在 Excel
+			// 中打开时会重算，但本库不重算，故可能呈现为错误值。
 			if len(r.data) < 14 {
 				continue
 			}
 			row := int(binary.LittleEndian.Uint16(r.data[0:]))
 			col := int(binary.LittleEndian.Uint16(r.data[2:]))
 
-			// 若结果为字符串，第 6..13 字节形如 00 ... FF FF。
-			if r.data[12] == 0xFF && r.data[13] == 0xFF && r.data[6] == 0x00 {
-				if i+1 < len(recs) && recs[i+1].typ == recString {
-					if s, _, ok := readUnicodeString(recs[i+1].data, 0); ok {
-						note(row, col, s)
+			specialHead := r.data[6] == 0xFF && r.data[7] == 0xFF
+			specialTail := r.data[12] == 0xFF && r.data[13] == 0xFF
+
+			if specialHead {
+				switch r.data[8] {
+				case 0x00: // 字符串结果，跟随 STRING 记录
+					if i+1 < len(recs) && recs[i+1].typ == recString {
+						if s, _, ok := readUnicodeString(recs[i+1].data, 0); ok {
+							note(row, col, s)
+						}
 					}
+					continue
+				case 0x01: // 布尔结果（b[9] 为值）
+					if r.data[9] != 0 {
+						note(row, col, "TRUE")
+					} else {
+						note(row, col, "FALSE")
+					}
+					continue
+				case 0x02: // 错误结果（b[9] 为错误码）
+					note(row, col, xlsErrorString(r.data[9]))
+					continue
 				}
 				continue
 			}
+			if specialTail {
+				// xlwt 风格：data[6] 为错误/未计算标志。
+				note(row, col, xlsErrorString(r.data[6]))
+				continue
+			}
+			// 数值结果（IEEE 754 双精度）。
 			bits := binary.LittleEndian.Uint64(r.data[6:])
 			note(row, col, formatFloat(math.Float64frombits(bits)))
 		}
@@ -441,6 +482,31 @@ func parseSheetCells(stream []byte, sst []string) [][]string {
 		grid[c.row][c.col] = c.value
 	}
 	return grid
+}
+
+// xlsErrorString 把 BIFF 的错误码映射为 Excel 显示的错误字符串。
+// 映射关系与 LibreOffice 的 ScGlobal::GetErrorString 一致。
+func xlsErrorString(code byte) string {
+	switch code {
+	case 0x00:
+		return "#NULL!"
+	case 0x01:
+		return "#DIV/0!"
+	case 0x02:
+		return "#VALUE!"
+	case 0x03:
+		return "#REF!"
+	case 0x04:
+		return "#NAME?"
+	case 0x05:
+		return "#NUM!"
+	case 0x06:
+		return "#N/A"
+	case 0x07:
+		return "#GETTING_DATA"
+	default:
+		return "#ERR"
+	}
 }
 
 // decodeRK 解码 RK 值。
